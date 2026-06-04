@@ -1,0 +1,19 @@
+# ML models
+*.pth
+*.pt
+*.h5
+*.ckpt
+
+# Python cache
+__pycache__/
+*.pyc
+
+# outputs (IMPORTANT - your images)
+chest_xray_project/outputs/
+
+# datasets
+dataset/
+data/
+
+# node modules
+node_modules/
