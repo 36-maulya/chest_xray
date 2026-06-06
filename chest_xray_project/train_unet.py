@@ -15,9 +15,9 @@ IMAGE_FOLDER = r"E:\normal_dataset\Normal images"
 MASK_FOLDER  = r"data\masks"
 EXCEL_PATH   = r"E:\normal_dataset\auto_annotations.xlsx"
 MODEL_PATH   = r"models\unet_xray.pth"
-IMG_SIZE     = 256
-BATCH_SIZE   = 8
-EPOCHS       = 20
+IMG_SIZE     = 128
+BATCH_SIZE   = 4
+EPOCHS       = 15
 LR           = 0.001
 VAL_SPLIT    = 0.1
 

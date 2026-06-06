@@ -50,8 +50,8 @@ for _, row in df.iterrows():
         f"{image_num}.jpeg",
         f"{image_num}.jpg",
         f"{image_num}.png",
-        f"{image_num}(2).jpeg",
-        f"{image_num}(2).jpg",
+        f"{image_num}(1).jpeg",
+        f"{image_num}(1).jpg",
     ]
 
     for filename in possible:
