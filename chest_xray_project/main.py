@@ -498,7 +498,9 @@ async def analyze(file: UploadFile = File(...)):
         print("\n===== MEDIASTINAL ANALYSIS =====")
         print("Shift:", mediastinal_shift)
         print("Status:", mediastinal_status)
-        
+        print("\n🧠 MODEL 1: ROTATION CLASSIFIER (EfficientNet)")
+        print(f"👉 Prediction: {pred_class.upper()}")
+        print(f"👉 Confidence: {confidence:.2f}%")
         # Threshold Constraints Evaluation
         if pred_class == 'normal' and confidence > 70.0:
             final_status = "NORMAL"
