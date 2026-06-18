@@ -203,7 +203,6 @@ def detect_landmarks_xrv(img_cv2):
                 x, y = get_pos(landmarks_maps[i], w_orig, h_orig)
                 if "spine" in ll:
                     spine_x = x
-                    spine_y = y
                 elif "left clavicle" in ll:
                     clav_lx, clav_ly = x, y
                 elif "right clavicle" in ll:
@@ -219,12 +218,6 @@ def detect_landmarks_xrv(img_cv2):
                 elif "right lung" in ll:
                     right_lung_x, right_lung_y = x, y
             
-            # Fix swapped clavicles
-            if clav_lx is not None and clav_rx is not None:
-                if clav_lx > clav_rx:
-                    clav_lx, clav_rx = clav_rx, clav_lx
-                    clav_ly, clav_ry = clav_ry, clav_ly
-
             # Dynamic fallback placement based on frame scale
             spine_x = spine_x or w_orig // 2
             clav_lx = clav_lx or int(w_orig * 0.3)
@@ -236,17 +229,14 @@ def detect_landmarks_xrv(img_cv2):
             print("Spine X:", spine_x)
             print("Left Clavicle :", clav_lx, clav_ly)
             print("Right Clavicle:", clav_rx, clav_ry)
-            
             print("\n===== WARP LANDMARKS =====")
             print("Left Scapula :", left_scapula_x, left_scapula_y)
             print("Right Scapula:", right_scapula_x, right_scapula_y)
             print("Left Lung :", left_lung_x, left_lung_y)
             print("Right Lung :", right_lung_x, right_lung_y)
-            print("Spine:", spine_x, spine_y)
             
             return {
                 "spine_x": spine_x,
-                "spine_y": spine_y,
                 "mediastinum_x": mediastinum_x,
                 "mediastinum_y": mediastinum_y,
                 "left_scapula_x": left_scapula_x,
@@ -273,26 +263,10 @@ def detect_landmarks_xrv(img_cv2):
 def visualize_landmarks(img_cv2, landmarks):
     vis = img_cv2.copy()
     points = [
-    ("Spine", landmarks["spine_x"], img_cv2.shape[0] // 2),
-    ("L-Clav", landmarks["clavicle_left_x"], landmarks["clavicle_left_y"]),
-    ("R-Clav", landmarks["clavicle_right_x"], landmarks["clavicle_right_y"]),
+        ("Spine", landmarks["spine_x"], img_cv2.shape[0] // 2),
+        ("L-Clav", landmarks["clavicle_left_x"], landmarks["clavicle_left_y"]),
+        ("R-Clav", landmarks["clavicle_right_x"], landmarks["clavicle_right_y"]),
     ]
-
-    cv2.line(
-        vis,
-        (landmarks["spine_x"], landmarks["clavicle_left_y"]),
-        (landmarks["clavicle_left_x"], landmarks["clavicle_left_y"]),
-        (0,255,255),
-        2
-    )
-
-    cv2.line(
-        vis,
-        (landmarks["spine_x"], landmarks["clavicle_right_y"]),
-        (landmarks["clavicle_right_x"], landmarks["clavicle_right_y"]),
-        (255,255,0),
-        2
-    )
     
     for name, x, y in points:
         cv2.circle(vis, (int(x), int(y)), 8, (0, 255, 0), -1)
@@ -300,9 +274,6 @@ def visualize_landmarks(img_cv2, landmarks):
             vis, name, (int(x) + 10, int(y) - 10),
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2
         )
-    print("Left clavicle:", landmarks["clavicle_left_x"])
-    print("Right clavicle:", landmarks["clavicle_right_x"])
-    print("Spine:", landmarks["spine_x"])    
     
     return vis
 
@@ -310,55 +281,30 @@ def visualize_landmarks(img_cv2, landmarks):
 # CALCULATE CORRECTION ANGLE (MATH FIXED)
 # ─────────────────────────────────────────────
 def calculate_correction_angle(lm):
-    spine_x = lm.get("mediastinum_x", lm["spine_x"])
-    print("Spine:", lm["spine_x"], lm["spine_y"])
-    
+    spine_x = lm["spine_x"]
     lx, ly = lm["clavicle_left_x"], lm["clavicle_left_y"]
     rx, ry = lm["clavicle_right_x"], lm["clavicle_right_y"]
-    # Estimated medial clavicle points
-    medial_lx = int(lx + (spine_x - lx) * 0.85)
-    medial_rx = int(rx - (rx - spine_x) * 0.85)
-
-    print("Estimated Left Medial:", medial_lx)
-    print("Estimated Right Medial:", medial_rx)
-    left_dist = abs(spine_x - medial_lx)
-    right_dist = abs(medial_rx - spine_x)
-    print("Medical Left Distance:", left_dist)
-    print("Medical Right Distance:", right_dist)
-    PIXEL_SPACING_MM = 0.912
-
-    left_cm = round((left_dist * PIXEL_SPACING_MM) / 10, 2)
-    right_cm = round((right_dist * PIXEL_SPACING_MM) / 10, 2)
-    print("Left Pixel Distance:", left_dist)
-    print("Right Pixel Distance:", right_dist)
-    print("Left CM:", left_cm)
-    print("Right CM:", right_cm)
-    print("Spine X:", spine_x)
-    print("Left Clavicle X:", lx)
-    print("Right Clavicle X:", rx)
-    rotation_ratio = abs(left_dist - right_dist) / (left_dist + right_dist)
-
     
+    left_dist = abs(spine_x - lx)
+    right_dist = abs(rx - spine_x)
+    
+    dpi = 72
+    left_cm = round((left_dist / dpi) * 2.54, 2)
+    right_cm = round((right_dist / dpi) * 2.54, 2)
+    asymmetry = round(abs(left_cm - right_cm), 2)
     
     diff = right_dist - left_dist
-    if rotation_ratio < 0.05:
-        return 0.0, left_cm, right_cm, rotation_ratio, "None", "None"
+    if abs(diff) < 15:
+        return 0.0, left_cm, right_cm, asymmetry, "None", "None"
     
     # FIX: Account for downward-increasing Y pixel coordinate grid in CV2
     angle = math.degrees(math.atan2(ly - ry, rx - lx))
     angle = max(min(round(angle, 1), 15.0), -15.0)
     
     direction = "Left rotation" if diff > 0 else "Right rotation"
-    if rotation_ratio < 0.05:
-        severity = "None"
-    elif rotation_ratio < 0.10:
-        severity = "Mild"
-    elif rotation_ratio < 0.20:
-        severity = "Moderate"
-    else:
-        severity = "Severe"
+    severity = "None" if asymmetry < 0.5 else "Mild" if asymmetry < 1.0 else "Moderate" if asymmetry < 2.0 else "Severe"
     
-    return angle, left_cm, right_cm, rotation_ratio, direction, severity
+    return angle, left_cm, right_cm, asymmetry, direction, severity
 
 def calculate_mediastinal_shift(lm):
     spine_x = lm["spine_x"]
@@ -400,15 +346,14 @@ def calculate_scapular_position(lm):
 # ─────────────────────────────────────────────
 # GEOMETRY-BASED DECISION ENGINE (NEW)
 # ─────────────────────────────────────────────
-def geometry_decision(angle, rotation_ratio):
+def geometry_decision(angle, asymmetry):
     """
     Strong rule-based anatomical decision system
     This becomes the PRIMARY decision maker
     """
-    if rotation_ratio > 0.15:
+    if abs(angle) > 3 or asymmetry > 0.8:
         return "rotated"
-    else:
-        return "normal"
+    return "normal"
 
 # ─────────────────────────────────────────────
 # HIGH-FIDELITY RADIAL TRANSFORM MATRIX
@@ -448,43 +393,16 @@ def anatomical_warp_correction(img_cv2, landmarks):
     
     dst = src.copy()
     avg_clav_y = (landmarks["clavicle_left_y"] + landmarks["clavicle_right_y"]) / 2
-    spine_x = landmarks["spine_x"]
-
-    # Estimate medial clavicle ends
-    medial_left_x = int(
-        landmarks["clavicle_left_x"] +
-        (spine_x - landmarks["clavicle_left_x"]) * 0.75
-    )
-
-    medial_right_x = int(
-        landmarks["clavicle_right_x"] -
-        (landmarks["clavicle_right_x"] - spine_x) * 0.75
-    )
-
-    left_dist = spine_x - medial_left_x
-    right_dist = medial_right_x - spine_x
-
-    target_dist = (left_dist + right_dist) / 2
-
-    new_left_x = spine_x - target_dist
-    new_right_x = spine_x + target_dist
-    # Amount to move each medial clavicle
-    left_shift = new_left_x - medial_left_x
-    right_shift = new_right_x - medial_right_x
-    MAX_SHIFT = 15
-
-    left_shift = np.clip(left_shift, -MAX_SHIFT, MAX_SHIFT)
-    right_shift = np.clip(right_shift, -MAX_SHIFT, MAX_SHIFT)
-    print("Left Shift:", left_shift)
-    print("Right Shift:", right_shift)
+    
     # Small corrections only
-    # Move clavicles only by required medial correction amount
-    dst[4, 0] = src[4, 0] + left_shift
-    dst[5, 0] = src[5, 0] + right_shift
     dst[4, 1] = avg_clav_y
     dst[5, 1] = avg_clav_y
-    dst[6, 0] = src[6, 0]
-    
+    spine_shift = (w / 2) - landmarks["spine_x"]
+    dst[6, 0] += spine_shift * 0.2
+    dst[7, 0] += spine_shift * 0.1
+    dst[8, 0] += spine_shift * 0.1
+    dst[9, 0] += spine_shift * 0.05
+    dst[10, 0] += spine_shift * 0.05
     
     tform = PiecewiseAffineTransform()
     tform.estimate(src, dst)
@@ -584,7 +502,7 @@ async def analyze(file: UploadFile = File(...)):
             os.path.join(OUTPUT_DIR, "debug_landmarks.jpg"),
             debug_img
         )
-        angle, left_cm, right_cm, rotation_ratio, direction, severity = calculate_correction_angle(landmarks)
+        angle, left_cm, right_cm, asymmetry, direction, severity = calculate_correction_angle(landmarks)
         mediastinal_shift, mediastinal_status = calculate_mediastinal_shift(landmarks)
         scapular_status = calculate_scapular_position(landmarks)
         # ─────────────────────────────────────────────
@@ -594,16 +512,13 @@ async def analyze(file: UploadFile = File(...)):
         
         
 
-        geo_class = geometry_decision(angle, rotation_ratio)
-        print("Geo Class:", geo_class)
-        print("Angle:", angle)
-        
-        print("\n🧠 FINAL DIAGNOSIS ENGINE")
-        
-        print(f"👉 Rotation Angle: {angle:.2f}°")
-        print(f"👉 Rotation Ratio: {rotation_ratio:.3f}")
-        print(f"👉 Direction: {direction}")
-        print(f"👉 Severity: {severity}")
+        geo_class = geometry_decision(angle, asymmetry)
+
+        print("\n🧠 HYBRID DECISION ENGINE")
+        print(f"👉 CNN Prediction: {cnn_class.upper()} ({cnn_conf:.2f}%)")
+        print(f"👉 Geometry Prediction: {geo_class.upper()}")
+        print(f"👉 Angle: {angle}, Asymmetry: {asymmetry}")
+
         # FINAL DECISION LOGIC (GEOMETRY FIRST)
         if geo_class == "rotated":
             final_status = "ROTATED"
@@ -618,7 +533,7 @@ async def analyze(file: UploadFile = File(...)):
        
         
         corrected_b64 = None
-        if final_status == "ROTATED" and rotation_ratio > 0.15:
+        if final_status == "ROTATED" and asymmetry > 0.4:
             corrected_cv2 = anatomical_warp_correction(img_cv2, landmarks)
             corrected_b64 = image_to_base64(corrected_cv2)
             out_path = os.path.join(OUTPUT_DIR, f"corrected_{file.filename}")
@@ -627,11 +542,12 @@ async def analyze(file: UploadFile = File(...)):
             print("✅ Alignment within normal margins — skipping correction pipeline")
         
         original_b64 = image_to_base64(img_cv2)
-        final_prediction = final_status
+        
         return JSONResponse({
             "valid": True,
-            "final_prediction": final_prediction,
-            "geometry_prediction": geo_class,
+            "cnn_prediction": cnn_class.upper(),
+            "model_accuracy": round(cnn_conf, 2),
+            "confidence": round(cnn_conf, 1),
             "normal_conf": round(normal_conf, 1),
             "rotated_conf": round(rotated_conf, 1),
             "mediastinal_shift": mediastinal_shift,
@@ -641,7 +557,7 @@ async def analyze(file: UploadFile = File(...)):
             "direction": direction,
             "severity": severity,
             "angle": angle,
-            "rotation_ratio": rotation_ratio,
+            "asymmetry": asymmetry,
             "right_cm": right_cm,
             "left_cm": left_cm,
             "original_img": original_b64,
