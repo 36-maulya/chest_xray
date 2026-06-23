@@ -1,10 +1,7 @@
 import os
 import cv2
 import torch
-from skimage.transform import PiecewiseAffineTransform
-from skimage.transform import warp
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,103 +28,105 @@ app.add_middleware(
 )
 
 # ─────────────────────────────────────────────
-# CONFIGURATION & TOGGLES (CRITICAL FOR DEMO)
+# CONFIGURATION & TOGGLES
 # ─────────────────────────────────────────────
 EFFICIENTNET_PATH = r"models\efficientnet_xray_v2.pth"
-CYCLEGAN_PATH = r"models\cyclegan_xray.pth"
+CLAVICLE_MODEL_PATH = r"models\clavicle_distance_model.pth"
+
 OUTPUT_DIR = r"outputs"
 IMG_SIZE = 224
-CYCLEGAN_SIZE = 256
 CLASS_NAMES = ['normal', 'rotated']
-
-# SET TO TRUE ONLY IF YOUR CYCLEGAN IS FULLY RETRAINED TO HIGH RESOLUTION.
-# Keeping this False forces the system to use high-fidelity geometric alignment,
-# which keeps your demo images beautifully sharp instead of blurry/squished.
-USE_EXPERIMENTAL_CYCLEGAN = False
+PIXEL_SPACING_MM = 0.912
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
+
 # ─────────────────────────────────────────────
-# MODEL 1 — EFFICIENTNET
+# CLAVICLE DISTANCE REGRESSION MODEL
+# ─────────────────────────────────────────────
+class ClavicleDistanceRegressor(nn.Module):
+
+    def __init__(self, pretrained=False):
+        super().__init__()
+
+        self.backbone = timm.create_model(
+            "efficientnet_b0",
+            pretrained=pretrained,
+            num_classes=0
+        )
+
+        self.head = nn.Sequential(
+            nn.Dropout(0.3),       # 0
+            nn.Linear(1280, 512),  # 1
+            nn.ReLU(),             # 2
+            nn.BatchNorm1d(512),   # 3
+            nn.Dropout(0.2),       # 4
+            nn.Linear(512, 128),   # 5
+            nn.ReLU(),             # 6
+            nn.Identity(),         # 7
+            nn.Linear(128, 2)      # 8
+        )
+
+    def forward(self, x):
+        features = self.backbone(x)
+        return self.head(features)
+# ─────────────────────────────────────────────
+# MODEL INITIALIZATIONS
 # ─────────────────────────────────────────────
 efficientnet = timm.create_model('efficientnet_b0', pretrained=False, num_classes=2)
 efficientnet.load_state_dict(torch.load(EFFICIENTNET_PATH, map_location=device))
 efficientnet.eval()
 efficientnet.to(device)
 print("✅ EfficientNet loaded! (Rotation Detection)")
+# ─────────────────────────────────────────────
+# LOAD CLAVICLE DISTANCE MODEL
+# ─────────────────────────────────────────────
+print("Loading clavicle distance model...")
 
-# ─────────────────────────────────────────────
-# MODEL 2 — TORCHXRAYVISION
-# ─────────────────────────────────────────────
+clavicle_model = ClavicleDistanceRegressor(pretrained=False)
+
+checkpoint = torch.load(CLAVICLE_MODEL_PATH, map_location=device)
+
+print("\n===== CHECKPOINT TYPE =====")
+print(type(checkpoint))
+
+if isinstance(checkpoint, dict):
+    print("\n===== CHECKPOINT KEYS =====")
+    print(checkpoint.keys())
+
+if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+    state_dict = checkpoint["model_state_dict"]
+else:
+    state_dict = checkpoint
+
+print("\n===== HEAD KEYS =====")
+for k in state_dict.keys():
+    if k.startswith("head"):
+        print(k)
+
+missing, unexpected = clavicle_model.load_state_dict(
+    state_dict,
+    strict=False
+)
+
+print("\n===== LOAD RESULT =====")
+print("Missing:", missing)
+print("Unexpected:", unexpected)
+
+clavicle_model.eval()
+clavicle_model.to(device)
+
+print("✅ Clavicle Distance Model loaded!")
+
 print("Loading TorchXRayVision...")
 xrv_model = xrv.baseline_models.chestx_det.PSPNet()
 xrv_model.eval()
 print("✅ TorchXRayVision loaded! (Landmark Detection)")
 
 # ─────────────────────────────────────────────
-# MODEL 3 — CYCLEGAN GENERATOR ARCHITECTURE
-# ─────────────────────────────────────────────
-class ResBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.ReflectionPad2d(1),
-            nn.Conv2d(channels, channels, 3),
-            nn.InstanceNorm2d(channels),
-            nn.ReLU(True),
-            nn.ReflectionPad2d(1),
-            nn.Conv2d(channels, channels, 3),
-            nn.InstanceNorm2d(channels),
-        )
-    
-    def forward(self, x):
-        return x + self.block(x)
-
-class Generator(nn.Module):
-    def __init__(self, n_res=6):
-        super().__init__()
-        self.encoder = nn.Sequential(
-            nn.ReflectionPad2d(3),
-            nn.Conv2d(1, 64, 7),
-            nn.InstanceNorm2d(64),
-            nn.ReLU(True),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),
-            nn.InstanceNorm2d(128),
-            nn.ReLU(True),
-            nn.Conv2d(128, 256, 3, stride=2, padding=1),
-            nn.InstanceNorm2d(256),
-            nn.ReLU(True),
-        )
-        self.res_blocks = nn.Sequential(*[ResBlock(256) for _ in range(n_res)])
-        self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, 3, stride=2, padding=1, output_padding=1),
-            nn.InstanceNorm2d(128),
-            nn.ReLU(True),
-            nn.ConvTranspose2d(128, 64, 3, stride=2, padding=1, output_padding=1),
-            nn.InstanceNorm2d(64),
-            nn.ReLU(True),
-            nn.ReflectionPad2d(3),
-            nn.Conv2d(64, 1, 7),
-            nn.Tanh()
-        )
-    
-    def forward(self, x):
-        return self.decoder(self.res_blocks(self.encoder(x)))
-
-# Safe Initialization of CycleGAN Weights
-cyclegan = Generator().to(device)
-if os.path.exists(CYCLEGAN_PATH):
-    cyclegan.load_state_dict(torch.load(CYCLEGAN_PATH, map_location=device))
-    cyclegan.eval()
-    print("✅ CycleGAN weights loaded successfully!")
-else:
-    cyclegan = None
-    print("⚠️ CycleGAN weights missing — falling back to geometric matrix adjustments")
-
-# ─────────────────────────────────────────────
-# PREPROCESSING & IMAGE LIFTS
+# PREPROCESSING & HELPER UTILITIES
 # ─────────────────────────────────────────────
 efficientnet_transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
@@ -136,19 +135,26 @@ efficientnet_transform = transforms.Compose([
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
-cyclegan_transform = transforms.Compose([
-    transforms.ToPILImage(),
-    transforms.Resize((CYCLEGAN_SIZE, CYCLEGAN_SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize([0.5], [0.5])
-])
-
 def is_valid_xray(img: Image.Image) -> bool:
     gray = np.array(img.convert("L"))
     mean_brightness = gray.mean()
     std_brightness = gray.std()
     return 20 < mean_brightness < 230 and std_brightness >= 15
 
+def image_to_base64(img_array):
+    _, buffer = cv2.imencode('.jpg', img_array)
+    return base64.b64encode(buffer).decode('utf-8')
+
+def get_medial_clavicle(lx, ly, spine_x, side="left"):
+    if side == "left":
+        medial_x = lx + (spine_x - lx) * 0.85
+    else:
+        medial_x = lx - (lx - spine_x) * 0.85
+    return int(medial_x), int(ly)
+
+# ─────────────────────────────────────────────
+# ANALYSIS & PREDICTION ENGINES
+# ─────────────────────────────────────────────
 def predict_image(img: Image.Image):
     tensor = efficientnet_transform(img).unsqueeze(0).to(device)
     with torch.no_grad():
@@ -156,17 +162,28 @@ def predict_image(img: Image.Image):
         probs = torch.softmax(output, dim=1)
         confidence = probs.max().item() * 100
         pred_idx = probs.argmax().item()
-        pred_class = CLASS_NAMES[pred_idx]
-        normal_conf = probs[0][0].item() * 100
-        rotated_conf = probs[0][1].item() * 100
-        return pred_class, confidence, normal_conf, rotated_conf
+        return CLASS_NAMES[pred_idx], confidence, probs[0][0].item() * 100, probs[0][1].item() * 100
+def predict_clavicle_distances(img: Image.Image):
+    """
+    Returns:
+        left_cm, right_cm
+    """
 
-def detect_landmarks_xrv(img_cv2):
+    tensor = efficientnet_transform(img).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        pred = clavicle_model(tensor).cpu().numpy()[0]
+
+    left_cm = round(max(0.1, float(pred[0])), 2)
+    right_cm = round(max(0.1, float(pred[1])), 2)
+
+    return left_cm, right_cm
+
+def detect_landmarks_xrv(img_cv2, is_corrected=False):
     try:
         h_orig, w_orig = img_cv2.shape[:2]
         gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
-        img_xrv = gray.astype(np.float32)
-        img_xrv = img_xrv / 255.0 * 2048 - 1024
+        img_xrv = (gray.astype(np.float32) / 255.0) * 2048 - 1024
         img_xrv = skimage.transform.resize(img_xrv, (512, 512), anti_aliasing=True)
         img_tensor = torch.from_numpy(img_xrv).unsqueeze(0).unsqueeze(0).float().to(device)
         
@@ -175,377 +192,280 @@ def detect_landmarks_xrv(img_cv2):
             landmarks_maps = output[0].detach().cpu().numpy()
             targets = xrv_model.targets
             
-            print("\n===== PSPNet Targets =====")
-            for i, label in enumerate(targets):
-                print(i, label)
-            
             def get_pos(hmap, ow, oh):
                 hmap = cv2.resize(hmap, (ow, oh))
                 y, x = np.unravel_index(np.argmax(hmap), hmap.shape)
                 return int(x), int(y)
             
-            print("\n===== ALL LANDMARKS =====")
-            for i, label in enumerate(targets):
-                x, y = get_pos(landmarks_maps[i], w_orig, h_orig)
-                print(f"{label}: ({x},{y})")
-            
-            spine_x = None
-            clav_lx = clav_ly = None
-            clav_rx = clav_ry = None
-            mediastinum_x = mediastinum_y = None
-            left_scapula_x = left_scapula_y = None
-            right_scapula_x = right_scapula_y = None
-            left_lung_x = left_lung_y = None
-            right_lung_x = right_lung_y = None
-            
+            landmarks = {}
             for i, label in enumerate(targets):
                 ll = label.lower()
                 x, y = get_pos(landmarks_maps[i], w_orig, h_orig)
                 if "spine" in ll:
-                    spine_x = x
-                    spine_y = y
+                    landmarks["spine_x"], landmarks["spine_y"] = x, y
                 elif "left clavicle" in ll:
-                    clav_lx, clav_ly = x, y
+                    landmarks["clav_lx"], landmarks["clav_ly"] = x, y
                 elif "right clavicle" in ll:
-                    clav_rx, clav_ry = x, y
+                    landmarks["clav_rx"], landmarks["clav_ry"] = x, y
                 elif "mediastinum" in ll:
-                    mediastinum_x, mediastinum_y = x, y
+                    landmarks["mediastinum_x"], landmarks["mediastinum_y"] = x, y
                 elif "left scapula" in ll:
-                    left_scapula_x, left_scapula_y = x, y
+                    landmarks["left_scapula_x"], landmarks["left_scapula_y"] = x, y
                 elif "right scapula" in ll:
-                    right_scapula_x, right_scapula_y = x, y
+                    landmarks["right_scapula_x"], landmarks["right_scapula_y"] = x, y
                 elif "left lung" in ll:
-                    left_lung_x, left_lung_y = x, y
+                    landmarks["left_lung_x"], landmarks["left_lung_y"] = x, y
                 elif "right lung" in ll:
-                    right_lung_x, right_lung_y = x, y
-            
-            # Fix swapped clavicles
-            if clav_lx is not None and clav_rx is not None:
-                if clav_lx > clav_rx:
-                    clav_lx, clav_rx = clav_rx, clav_lx
-                    clav_ly, clav_ry = clav_ry, clav_ly
+                    landmarks["right_lung_x"], landmarks["right_lung_y"] = x, y
 
-            # Dynamic fallback placement based on frame scale
-            spine_x = spine_x or w_orig // 2
-            clav_lx = clav_lx or int(w_orig * 0.3)
-            clav_rx = clav_rx or int(w_orig * 0.7)
-            clav_ly = clav_ly or int(h_orig * 0.2)
-            clav_ry = clav_ry or int(h_orig * 0.2)
+            spine_x = landmarks.get("spine_x", w_orig // 2)
+            clav_lx = landmarks.get("clav_lx", int(w_orig * 0.3))
+            clav_rx = landmarks.get("clav_rx", int(w_orig * 0.7))
             
-            print("\n===== DETECTED LANDMARKS =====")
-            print("Spine X:", spine_x)
-            print("Left Clavicle :", clav_lx, clav_ly)
-            print("Right Clavicle:", clav_rx, clav_ry)
+            if clav_lx > clav_rx:
+                clav_lx, clav_rx = clav_rx, clav_lx
+                landmarks["clav_ly"], landmarks["clav_ry"] = landmarks.get("clav_ry", int(h_orig * 0.2)), landmarks.get("clav_ly", int(h_orig * 0.2))
             
-            print("\n===== WARP LANDMARKS =====")
-            print("Left Scapula :", left_scapula_x, left_scapula_y)
-            print("Right Scapula:", right_scapula_x, right_scapula_y)
-            print("Left Lung :", left_lung_x, left_lung_y)
-            print("Right Lung :", right_lung_x, right_lung_y)
-            print("Spine:", spine_x, spine_y)
+            if clav_lx > spine_x: clav_lx = int(w_orig * 0.35)
+            if clav_rx < spine_x: clav_rx = int(w_orig * 0.65)
+            
+            mediastinum_y = landmarks.get("mediastinum_y", int(h_orig * 0.4))
+            
+            # ────────────────────────────────────────────────────────
+            # 🖥️ DYNAMIC TERMINAL HEADING
+            # ────────────────────────────────────────────────────────
+            label_status = "✨ POST-CORRECTION" if is_corrected else "📁 RAW ORIGINAL"
+            print("\n" + "="*40)
+            print(f"    📍 DETECTED LANDMARKS ({label_status})      ")
+            print("="*40)
+            print(f"Spine Midpoint (X, Y) : ({spine_x}, {landmarks.get('spine_y')})")
+            print(f"Left Clavicle (X, Y)  : ({clav_lx}, {landmarks.get('clav_ly')})")
+            print(f"Right Clavicle (X, Y) : ({clav_rx}, {landmarks.get('clav_ry')})")
+            print(f"Mediastinum (X, Y)    : ({landmarks.get('mediastinum_x')}, {mediastinum_y})")
+            print("="*40 + "\n")
+            # ────────────────────────────────────────────────────────
             
             return {
                 "spine_x": spine_x,
-                "spine_y": spine_y,
-                "mediastinum_x": mediastinum_x,
+                "spine_y": landmarks.get("spine_y", h_orig // 2),
+                "mediastinum_x": landmarks.get("mediastinum_x", spine_x),
                 "mediastinum_y": mediastinum_y,
-                "left_scapula_x": left_scapula_x,
-                "left_scapula_y": left_scapula_y,
-                "right_scapula_x": right_scapula_x,
-                "right_scapula_y": right_scapula_y,
-                "left_lung_y": left_lung_y,
-                "right_lung_y": right_lung_y,
-                "left_lung_x": left_lung_x,
-                "right_lung_x": right_lung_x,
+                "search_x1": max(0, spine_x - 80),
+                "search_x2": min(w_orig, spine_x + 80),
+                "search_y1": max(0, mediastinum_y - 60),
+                "search_y2": min(h_orig, mediastinum_y + 60),
+                "left_scapula_x": landmarks.get("left_scapula_x"),
+                "left_scapula_y": landmarks.get("left_scapula_y"),
+                "right_scapula_x": landmarks.get("right_scapula_x"),
+                "right_scapula_y": landmarks.get("right_scapula_y"),
+                "left_lung_y": landmarks.get("left_lung_y"),
+                "right_lung_y": landmarks.get("right_lung_y"),
+                "left_lung_x": landmarks.get("left_lung_x"),
+                "right_lung_x": landmarks.get("right_lung_x"),
                 "spine_top_y": int(h_orig * 0.1),
                 "spine_bottom_y": int(h_orig * 0.85),
                 "clavicle_left_x": clav_lx,
-                "clavicle_left_y": clav_ly,
+                "clavicle_left_y": landmarks.get("clav_ly", int(h_orig * 0.2)),
                 "clavicle_right_x": clav_rx,
-                "clavicle_right_y": clav_ry,
+                "clavicle_right_y": landmarks.get("clav_ry", int(h_orig * 0.2)),
                 "image_w": w_orig,
                 "image_h": h_orig,
             }
     except Exception as e:
         print("XRV error:", e)
         return None
+def draw_clavicle_measurements(img, landmarks, save_path):
+    vis = img.copy()
+
+    spine_x = landmarks["spine_x"]
+
+    lx = landmarks["clavicle_left_x"]
+    ly = landmarks["clavicle_left_y"]
+
+    rx = landmarks["clavicle_right_x"]
+    ry = landmarks["clavicle_right_y"]
+
+    # medial points
+    medial_lx, _ = get_medial_clavicle(lx, ly, spine_x, "left")
+    medial_rx, _ = get_medial_clavicle(rx, ry, spine_x, "right")
+
+    left_px = abs(spine_x - medial_lx)
+    right_px = abs(medial_rx - spine_x)
+
+    left_cm = round((left_px * PIXEL_SPACING_MM) / 10, 2)
+    right_cm = round((right_px * PIXEL_SPACING_MM) / 10, 2)
+
+    top_y = min(ly, ry) - 20
+
+    # vertical spine line
+    cv2.line(
+        vis,
+        (spine_x, 50),
+        (spine_x, vis.shape[0]-50),
+        (0,0,0),
+        2
+    )
+
+    # horizontal left
+    cv2.line(
+        vis,
+        (medial_lx, ly),
+        (spine_x, ly),
+        (0,0,0),
+        2
+    )
+
+    # horizontal right
+    cv2.line(
+        vis,
+        (spine_x, ry),
+        (medial_rx, ry),
+        (0,0,0),
+        2
+    )
+
+    cv2.putText(
+        vis,
+        f"{left_cm:.2f} cm",
+        (medial_lx - 120, ly + 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1,
+        (0,0,0),
+        2
+    )
+
+    cv2.putText(
+        vis,
+        f"{right_cm:.2f} cm",
+        (spine_x + 30, ry + 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1,
+        (0,0,0),
+        2
+    )
+
+    cv2.imwrite(save_path, vis)
+
+    return vis    
 
 def visualize_landmarks(img_cv2, landmarks):
     vis = img_cv2.copy()
+    spine_x = landmarks["spine_x"]
+    lx, ly = landmarks["clavicle_left_x"], landmarks["clavicle_left_y"]
+    rx, ry = landmarks["clavicle_right_x"], landmarks["clavicle_right_y"]
+    
+    medial_left_x = int(lx + (spine_x - lx) * 0.90)
+    medial_right_x = int(rx - (rx - spine_x) * 0.90)
+    avg_clav_y = int((ly + ry) / 2)
+
+    cv2.line(vis, (spine_x, ly), (lx, ly), (0, 255, 255), 2)
+    cv2.line(vis, (spine_x, ry), (rx, ry), (255, 255, 0), 2)
+
     points = [
-    ("Spine", landmarks["spine_x"], img_cv2.shape[0] // 2),
-    ("L-Clav", landmarks["clavicle_left_x"], landmarks["clavicle_left_y"]),
-    ("R-Clav", landmarks["clavicle_right_x"], landmarks["clavicle_right_y"]),
+        ("Spine", spine_x, img_cv2.shape[0] // 2),
+        ("L-Clav", lx, ly),
+        ("R-Clav", rx, ry),
+        ("L-Med", medial_left_x, avg_clav_y),
+        ("R-Med", medial_right_x, avg_clav_y)
     ]
-
-    cv2.line(
-        vis,
-        (landmarks["spine_x"], landmarks["clavicle_left_y"]),
-        (landmarks["clavicle_left_x"], landmarks["clavicle_left_y"]),
-        (0,255,255),
-        2
-    )
-
-    cv2.line(
-        vis,
-        (landmarks["spine_x"], landmarks["clavicle_right_y"]),
-        (landmarks["clavicle_right_x"], landmarks["clavicle_right_y"]),
-        (255,255,0),
-        2
-    )
     
     for name, x, y in points:
-        cv2.circle(vis, (int(x), int(y)), 8, (0, 255, 0), -1)
-        cv2.putText(
-            vis, name, (int(x) + 10, int(y) - 10),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2
-        )
-    print("Left clavicle:", landmarks["clavicle_left_x"])
-    print("Right clavicle:", landmarks["clavicle_right_x"])
-    print("Spine:", landmarks["spine_x"])    
-    
+        cv2.circle(vis, (x, y), 8, (0, 255, 0) if "Med" not in name else (0, 255, 255), -1)
+        cv2.putText(vis, name, (x + 10, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        
     return vis
 
-# ─────────────────────────────────────────────
-# CALCULATE CORRECTION ANGLE (MATH FIXED)
-# ─────────────────────────────────────────────
 def calculate_correction_angle(lm):
-    spine_x = lm.get("mediastinum_x", lm["spine_x"])
-    print("Spine:", lm["spine_x"], lm["spine_y"])
-    
+    spine_x = lm["spine_x"]
+
     lx, ly = lm["clavicle_left_x"], lm["clavicle_left_y"]
     rx, ry = lm["clavicle_right_x"], lm["clavicle_right_y"]
-    # Estimated medial clavicle points
+
     medial_lx = int(lx + (spine_x - lx) * 0.85)
     medial_rx = int(rx - (rx - spine_x) * 0.85)
 
-    print("Estimated Left Medial:", medial_lx)
-    print("Estimated Right Medial:", medial_rx)
     left_dist = abs(spine_x - medial_lx)
     right_dist = abs(medial_rx - spine_x)
-    print("Medical Left Distance:", left_dist)
-    print("Medical Right Distance:", right_dist)
-    PIXEL_SPACING_MM = 0.912
 
     left_cm = round((left_dist * PIXEL_SPACING_MM) / 10, 2)
     right_cm = round((right_dist * PIXEL_SPACING_MM) / 10, 2)
-    print("Left Pixel Distance:", left_dist)
-    print("Right Pixel Distance:", right_dist)
-    print("Left CM:", left_cm)
-    print("Right CM:", right_cm)
-    print("Spine X:", spine_x)
-    print("Left Clavicle X:", lx)
-    print("Right Clavicle X:", rx)
-    rotation_ratio = abs(left_dist - right_dist) / (left_dist + right_dist)
 
-    
-    
+    rotation_ratio = abs(left_dist - right_dist) / max(1, (left_dist + right_dist))
     diff = right_dist - left_dist
+
     if rotation_ratio < 0.05:
         return 0.0, left_cm, right_cm, rotation_ratio, "None", "None"
-    
-    # FIX: Account for downward-increasing Y pixel coordinate grid in CV2
+
     angle = math.degrees(math.atan2(ly - ry, rx - lx))
     angle = max(min(round(angle, 1), 15.0), -15.0)
-    
+
     direction = "Left rotation" if diff > 0 else "Right rotation"
-    if rotation_ratio < 0.05:
-        severity = "None"
-    elif rotation_ratio < 0.10:
+
+    if rotation_ratio < 0.10:
         severity = "Mild"
     elif rotation_ratio < 0.20:
         severity = "Moderate"
     else:
         severity = "Severe"
-    
+
     return angle, left_cm, right_cm, rotation_ratio, direction, severity
 
 def calculate_mediastinal_shift(lm):
     spine_x = lm["spine_x"]
     mediastinum_x = lm.get("mediastinum_x")
-    
-    if mediastinum_x is None:
-        return 0, "Unknown"
+    if mediastinum_x is None: return 0, "Unknown"
     
     shift = abs(mediastinum_x - spine_x)
-    if shift < 20:
-        status = "Normal"
-    elif shift < 40:
-        status = "Mild Shift"
-    else:
-        status = "Significant Shift"
-    
+    status = "Normal" if shift < 20 else "Mild Shift" if shift < 40 else "Significant Shift"
     return shift, status
 
 def calculate_scapular_position(lm):
-    ls_x = lm.get("left_scapula_x")
-    rs_x = lm.get("right_scapula_x")
-    ll_x = lm.get("left_lung_x")
-    rl_x = lm.get("right_lung_x")
+    ls_x, rs_x = lm.get("left_scapula_x"), lm.get("right_scapula_x")
+    ll_x, rl_x = lm.get("left_lung_x"), lm.get("right_lung_x")
+    if None in [ls_x, rs_x, ll_x, rl_x]: return "Unknown"
     
-    if None in [ls_x, rs_x, ll_x, rl_x]:
-        return "Unknown"
-    
-    left_overlap = abs(ls_x - ll_x)
-    right_overlap = abs(rs_x - rl_x)
-    avg_overlap = (left_overlap + right_overlap) / 2
-    
-    if avg_overlap > 100:
-        return "Good Retraction"
-    elif avg_overlap > 40:
-        return "Acceptable"
-    else:
-        return "Scapula Overlapping Lung Field"
+    avg_overlap = (abs(ls_x - ll_x) + abs(rs_x - rl_x)) / 2
+    return "Good Retraction" if avg_overlap > 100 else "Acceptable" if avg_overlap > 40 else "Scapula Overlapping Lung Field"
 
-# ─────────────────────────────────────────────
-# GEOMETRY-BASED DECISION ENGINE (NEW)
-# ─────────────────────────────────────────────
 def geometry_decision(angle, rotation_ratio):
-    """
-    Strong rule-based anatomical decision system
-    This becomes the PRIMARY decision maker
-    """
-    if rotation_ratio > 0.15:
-        return "rotated"
-    else:
-        return "normal"
+    return "rotated" if rotation_ratio > 0.15 else "normal"
 
 # ─────────────────────────────────────────────
-# HIGH-FIDELITY RADIAL TRANSFORM MATRIX
+# GEOMETRIC WARPING ALIGNMENT PIPELINE
 # ─────────────────────────────────────────────
-def rotate_spine_centered(img_cv2, angle, landmarks):
-    h, w = img_cv2.shape[:2]
-    
-    # Establish rotation center strictly on the patient's spinal path midline
-    center = (landmarks["spine_x"], h // 2)
-    
-    # Negative angle counteracts the positioning deviation cleanly
-    M = cv2.getRotationMatrix2D(center, -angle, 1.0)
-    
-    # LANCZOS4 preserves structural crispness perfectly, avoiding blur
-    return cv2.warpAffine(
-        img_cv2, M, (w, h),
-        flags=cv2.INTER_LANCZOS4,
-        borderMode=cv2.BORDER_REPLICATE
-    )
-
 def anatomical_warp_correction(img_cv2, landmarks):
     h, w = img_cv2.shape[:2]
-    
-    src = np.array([
-        [0, 0],
-        [w-1, 0],
-        [0, h-1],
-        [w-1, h-1],
-        [landmarks["clavicle_left_x"], landmarks["clavicle_left_y"]],
-        [landmarks["clavicle_right_x"], landmarks["clavicle_right_y"]],
-        [landmarks["spine_x"], h//2],
-        [landmarks["left_scapula_x"], landmarks["left_scapula_y"]],
-        [landmarks["right_scapula_x"], landmarks["right_scapula_y"]],
-        [landmarks["left_lung_x"], landmarks["left_lung_y"]],
-        [landmarks["right_lung_x"], landmarks["right_lung_y"]],
-    ], dtype=np.float32)
-    
-    dst = src.copy()
-    avg_clav_y = (landmarks["clavicle_left_y"] + landmarks["clavicle_right_y"]) / 2
     spine_x = landmarks["spine_x"]
+    lx, rx = landmarks["clavicle_left_x"], landmarks["clavicle_right_x"]
 
-    # Estimate medial clavicle ends
-    medial_left_x = int(
-        landmarks["clavicle_left_x"] +
-        (spine_x - landmarks["clavicle_left_x"]) * 0.75
-    )
+    left_dist = abs(spine_x - lx)
+    right_dist = abs(rx - spine_x)
+    rotation_ratio = abs(left_dist - right_dist) / max(1, (left_dist + right_dist))
 
-    medial_right_x = int(
-        landmarks["clavicle_right_x"] -
-        (landmarks["clavicle_right_x"] - spine_x) * 0.75
-    )
-
-    left_dist = spine_x - medial_left_x
-    right_dist = medial_right_x - spine_x
-
-    target_dist = (left_dist + right_dist) / 2
-
-    new_left_x = spine_x - target_dist
-    new_right_x = spine_x + target_dist
-    # Amount to move each medial clavicle
-    left_shift = new_left_x - medial_left_x
-    right_shift = new_right_x - medial_right_x
-    MAX_SHIFT = 15
-
-    left_shift = np.clip(left_shift, -MAX_SHIFT, MAX_SHIFT)
-    right_shift = np.clip(right_shift, -MAX_SHIFT, MAX_SHIFT)
-    print("Left Shift:", left_shift)
-    print("Right Shift:", right_shift)
-    # Small corrections only
-    # Move clavicles only by required medial correction amount
-    dst[4, 0] = src[4, 0] + left_shift
-    dst[5, 0] = src[5, 0] + right_shift
-    dst[4, 1] = avg_clav_y
-    dst[5, 1] = avg_clav_y
-    dst[6, 0] = src[6, 0]
+    correction_strength = 0.35 if rotation_ratio > 0.30 else 0.25 if rotation_ratio > 0.20 else 0.15
     
+    target_left = left_dist + (((left_dist + right_dist)/2) - left_dist) * correction_strength
+    target_right = right_dist + (((left_dist + right_dist)/2) - right_dist) * correction_strength    
     
-    tform = PiecewiseAffineTransform()
-    tform.estimate(src, dst)
+    scale_l = np.clip(target_left / max(1, left_dist), 0.9, 1.2)
+    scale_r = np.clip(target_right / max(1, right_dist), 0.9, 1.2)
+
+    map_x, map_y = np.zeros((h, w), dtype=np.float32), np.zeros((h, w), dtype=np.float32)
+
+    for y in range(h):
+        map_y[y, :] = y
+        for x in range(w):
+            if x < spine_x:
+                map_x[y, x] = spine_x - (spine_x - x) / scale_l
+            else:
+                map_x[y, x] = spine_x + (x - spine_x) / scale_r
     
-    warped = warp(
-        img_cv2, tform.inverse,
-        output_shape=(h, w),
-        preserve_range=True
-    )
-    
-    return warped.astype(np.uint8)
+    corrected = cv2.remap(img_cv2, map_x, map_y, interpolation=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
+    cv2.imwrite(os.path.join(OUTPUT_DIR, "debug_corrected.png"), corrected)
+    return corrected
 
 # ─────────────────────────────────────────────
-# CYCLEGAN INFERENCE INTERACTION
-# ─────────────────────────────────────────────
-def cyclegan_inference(img_cv2):
-    if cyclegan is None:
-        return img_cv2
-    
-    gray = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2GRAY)
-    tensor = cyclegan_transform(gray).unsqueeze(0).to(device)
-    
-    with torch.no_grad():
-        out = cyclegan(tensor)
-        out = out.squeeze().cpu().numpy()
-        out = (out + 1) / 2
-        out = np.clip(out, 0, 1)
-        out = (out * 255).astype(np.uint8)
-    
-    # Scale up reconstruction space to match native resolution bounds
-    out = cv2.resize(out, (img_cv2.shape[1], img_cv2.shape[0]))
-    return cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
-
-# ─────────────────────────────────────────────
-# CORE IMAGE ALIGNMENT CONTROLLER
-# ─────────────────────────────────────────────
-def correct_with_cyclegan(img_cv2, angle, landmarks):
-    try:
-        # Step 1: Perform precise, high-resolution geometric rotation first
-        corrected_geometric = rotate_spine_centered(img_cv2, angle, landmarks)
-        
-        # Step 2: Route through the experimental CycleGAN if enabled and loaded
-        if USE_EXPERIMENTAL_CYCLEGAN and cyclegan is not None:
-            corrected = cyclegan_inference(corrected_geometric)
-            print("🔬 Processed via Geometric Transformation + CycleGAN Module")
-        else:
-            corrected = corrected_geometric
-            print("📐 Processed via High-Fidelity Geometric Matrix Alignment")
-        
-        return corrected
-    except Exception as e:
-        print("\n===== RECONSTRUCTION FAULT =====")
-        traceback.print_exc()
-        return img_cv2
-
-def image_to_base64(img_array):
-    _, buffer = cv2.imencode('.jpg', img_array)
-    return base64.b64encode(buffer).decode('utf-8')
-
-# ─────────────────────────────────────────────
-# MAIN ENDPOINT
+# MAIN ROUTE ENDPOINT
 # ─────────────────────────────────────────────
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
@@ -554,83 +474,100 @@ async def analyze(file: UploadFile = File(...)):
         img_pil = Image.open(io.BytesIO(contents)).convert("RGB")
         
         if not is_valid_xray(img_pil):
-            return JSONResponse({
-                "valid": False,
-                "message": "Please upload a valid chest X-ray image."
-            })
-        
+            return JSONResponse({"valid": False, "message": "Please upload a valid chest X-ray image."})
         
         cnn_class, cnn_conf, normal_conf, rotated_conf = predict_image(img_pil)
+        model_left_cm, model_right_cm = predict_clavicle_distances(img_pil)
+        left_cm = model_left_cm
+        right_cm = model_right_cm
+
+        delta_cm = abs(left_cm - right_cm)
+
+        rotation_ratio = delta_cm / max(left_cm, right_cm)
+        print(
+            f"\n[Regression Model] "
+            f"Left: {model_left_cm} cm | "
+            f"Right: {model_right_cm} cm"
+        )
         cnn_signal = 1 if cnn_class == "rotated" else 0
         img_cv2 = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
         landmarks = detect_landmarks_xrv(img_cv2)
         
+        h, w = img_cv2.shape[:2]
         if landmarks is None:
-            h, w = img_cv2.shape[:2]
             landmarks = {
-                "spine_x": w // 2,
-                "spine_top_y": int(h * 0.1),
-                "spine_bottom_y": int(h * 0.85),
-                "clavicle_left_x": int(w * 0.28),
-                "clavicle_left_y": int(h * 0.22),
-                "clavicle_right_x": int(w * 0.72),
-                "clavicle_right_y": int(h * 0.22),
-                "image_w": w,
-                "image_h": h,
+                "spine_x": w // 2, "spine_top_y": int(h * 0.1), "spine_bottom_y": int(h * 0.85),
+                "clavicle_left_x": int(w * 0.28), "clavicle_left_y": int(h * 0.22),
+                "clavicle_right_x": int(w * 0.72), "clavicle_right_y": int(h * 0.22),
+                "image_w": w, "image_h": h,
             }
         
         debug_img = visualize_landmarks(img_cv2, landmarks)
-        cv2.imwrite(
-            os.path.join(OUTPUT_DIR, "debug_landmarks.jpg"),
-            debug_img
+        draw_clavicle_measurements(
+            img_cv2,
+            landmarks,
+            os.path.join(OUTPUT_DIR, "before_correction.jpg")
         )
+        cv2.imwrite(os.path.join(OUTPUT_DIR, "debug_landmarks.jpg"), debug_img)
+        
         angle, left_cm, right_cm, rotation_ratio, direction, severity = calculate_correction_angle(landmarks)
         mediastinal_shift, mediastinal_status = calculate_mediastinal_shift(landmarks)
         scapular_status = calculate_scapular_position(landmarks)
-        # ─────────────────────────────────────────────
-        # STEP 3: HYBRID DECISION ENGINE
-        # ─────────────────────────────────────────────
-
         
-        
-
         geo_class = geometry_decision(angle, rotation_ratio)
-        print("Geo Class:", geo_class)
-        print("Angle:", angle)
-        
-        print("\n🧠 FINAL DIAGNOSIS ENGINE")
-        
-        print(f"👉 Rotation Angle: {angle:.2f}°")
-        print(f"👉 Rotation Ratio: {rotation_ratio:.3f}")
-        print(f"👉 Direction: {direction}")
-        print(f"👉 Severity: {severity}")
-        # FINAL DECISION LOGIC (GEOMETRY FIRST)
-        if geo_class == "rotated":
-            final_status = "ROTATED"
-        elif cnn_signal == 1 and cnn_conf > 70:
-            final_status = "ROTATED"
-        else:
-            final_status = "NORMAL"
-
-        print(f"✅ FINAL STATUS: {final_status}")
-        
-        
-       
+        final_status = "ROTATED" if geo_class == "rotated" or (cnn_signal == 1 and cnn_conf > 70) else "NORMAL"
         
         corrected_b64 = None
-        if final_status == "ROTATED" and rotation_ratio > 0.15:
-            corrected_cv2 = anatomical_warp_correction(img_cv2, landmarks)
-            corrected_b64 = image_to_base64(corrected_cv2)
-            out_path = os.path.join(OUTPUT_DIR, f"corrected_{file.filename}")
-            cv2.imwrite(out_path, corrected_cv2)
-        else:
-            print("✅ Alignment within normal margins — skipping correction pipeline")
+        post_left_cm, post_right_cm = left_cm, right_cm 
         
-        original_b64 = image_to_base64(img_cv2)
-        final_prediction = final_status
+        if final_status == "ROTATED" and rotation_ratio > 0.15:
+            # Run the geometric transformation 
+            corrected_cv2 = anatomical_warp_correction(img_cv2, landmarks)
+            corrected_landmarks = detect_landmarks_xrv(corrected_cv2, is_corrected=True) or landmarks
+            corrected_landmarks["spine_x"] = landmarks["spine_x"]
+            draw_clavicle_measurements(
+            corrected_cv2,
+            corrected_landmarks,
+            os.path.join(OUTPUT_DIR, "after_correction.jpg")
+        )
+
+            # Calculate Post-Correction Metrics
+            spine_x_post = corrected_landmarks["spine_x"]
+            lx_post, _ = get_medial_clavicle(corrected_landmarks["clavicle_left_x"], corrected_landmarks["clavicle_left_y"], spine_x_post, "left")
+            rx_post, _ = get_medial_clavicle(corrected_landmarks["clavicle_right_x"], corrected_landmarks["clavicle_right_y"], spine_x_post, "right")
+            
+            post_left_cm = round((abs(spine_x_post - lx_post) * PIXEL_SPACING_MM) / 10, 2)
+            post_right_cm = round((abs(rx_post - spine_x_post) * PIXEL_SPACING_MM) / 10, 2)
+            
+            # ────────────────────────────────────────────────────────
+            # 🖥️ TERMINAL METRICS DASHBOARD (BEFORE VS AFTER)
+            # ────────────────────────────────────────────────────────
+            print("\n" + "█"*50)
+            print(" 📊 ANATOMICAL ALIGNMENT METRICS COMPARISON")
+            print("█"*50)
+            print(f"  DIAGNOSIS    : {final_status} ({severity})")
+            print(f"  DEVIATION    : {angle}° ({direction})")
+            print(f"  ROTATION RATIO: {rotation_ratio:.3f}")
+            print("-" * 50)
+            print(f"  METRIC          │  BEFORE CORRECTION  │  AFTER CORRECTION")
+            print("-" * 50)
+            print(f"  Left Clavicle   │  {left_cm:<16} cm │  {post_left_cm:<15} cm")
+            print(f"  Right Clavicle  │  {right_cm:<16} cm │  {post_right_cm:<15} cm")
+            print(f"  Asymmetry Delta │  {round(abs(left_cm - right_cm), 2):<16} cm │  {round(abs(post_left_cm - post_right_cm), 2):<15} cm")
+            print("█"*50 + "\n")
+            # ────────────────────────────────────────────────────────
+
+            corrected_b64 = image_to_base64(corrected_cv2)
+            cv2.imwrite(os.path.join(OUTPUT_DIR, f"corrected_{file.filename}"), corrected_cv2)
+        else:
+            print("\n" + "═"*50)
+            print(" ✅ ALIGNMENT WITHIN NORMAL MARGINS — SKIPPING WARP")
+            print(f"  Left Clavicle: {left_cm} cm  |  Right Clavicle: {right_cm} cm")
+            print("═"*50 + "\n")
+            
         return JSONResponse({
             "valid": True,
-            "final_prediction": final_prediction,
+            "final_prediction": final_status,
             "geometry_prediction": geo_class,
             "normal_conf": round(normal_conf, 1),
             "rotated_conf": round(rotated_conf, 1),
@@ -642,18 +579,17 @@ async def analyze(file: UploadFile = File(...)):
             "severity": severity,
             "angle": angle,
             "rotation_ratio": rotation_ratio,
-            "right_cm": right_cm,
             "left_cm": left_cm,
-            "original_img": original_b64,
-            "corrected_img": corrected_b64 if corrected_b64 else original_b64,
+            "right_cm": right_cm,
+            "post_corrected_left_cm": post_left_cm,
+            "post_corrected_right_cm": post_right_cm,
+            "original_img": image_to_base64(img_cv2),
+            "corrected_img": corrected_b64 if corrected_b64 else image_to_base64(img_cv2),
         })
-    
     except Exception as e:
-        print(f"❌ Error encountered: {str(e)}")
-        return JSONResponse({
-            "valid": False,
-            "message": f"Error: {str(e)}"
-        })
+        print(f"❌ Error: {str(e)}")
+        traceback.print_exc()
+        return JSONResponse({"valid": False, "message": f"Error: {str(e)}"})
 
 @app.get("/")
 def root():

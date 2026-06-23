@@ -98,14 +98,10 @@ export default function Results() {
         </div>
 
         {/* Stats Row */}
-        <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           {[
             { icon: "🧠", label: "Final Result",    value: current?.status === "ROTATED" ? "ROTATED" : "NORMAL"        },
-            { icon: "📊", label: "Confidence",    value: current 
-    ? (current.normal_conf > current.rotated_conf
-        ? `${current.normal_conf.toFixed(1)}% (${current.status === "ROTATED" ? "Rotated" : "Normal"})`
-        : `${current.rotated_conf.toFixed(1)}% (${current.status === "ROTATED" ? "Rotated" : "Normal"})`)
-    : "No Data"  },
+            
             { icon: "📏", label: "Rotation Ratio",     value: `${(current.rotation_ratio ).toFixed(3)}`         },
             { icon: "🔄", label: "Correction",    value: `${current.angle}°`               },
             { icon: "⚡", label: "Severity",      value: current.severity                  },
